@@ -7,14 +7,17 @@ on:
       channel_id:
         description: "YouTube チャンネル ID（省略時は Secrets の値を使用）"
         required: false
+        type: string
         default: "UCbc8fwhdUNlqi-J99ISYu4A"
       max_results:
         description: "取得する最大動画数"
         required: false
+        type: string
         default: "5"
       role_id:
         description: "メンションID"
         required: false
+        type: string
         default: "1506186376599834634"
 
 jobs:
