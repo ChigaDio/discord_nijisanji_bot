@@ -235,7 +235,7 @@ def parse_args():
     parser.add_argument("--channel-id", default=os.getenv("CHANNEL_ID"),      help="YouTube チャンネル ID (UC〇〇)")
     parser.add_argument("--mongo-uri",  default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
     parser.add_argument("--webhook",    default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
-    parser.add_argument("--role-id",    default=os.getenv("DISCORD_ROLE_ID"),  help="Discord ロール ID")
+    parser.add_argument("--role-id",    default=os.getenv("ROLE_ID"),  help="Discord ロール ID")
     return parser.parse_args()
 
 
