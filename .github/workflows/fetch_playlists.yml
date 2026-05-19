@@ -1,0 +1,49 @@
+name: "③ 再生リスト取得 & Discord 通知 (24時間ごと)"
+
+on:
+  # 毎日 JST 09:00 (UTC 00:00) に自動実行
+  schedule:
+    - cron: "0 0 * * *"
+  # 手動実行（初回セットアップ時などに使用）
+  workflow_dispatch:
+    inputs:
+      channel_id:
+        description: "YouTube チャンネル ID（省略時は Secrets の値を使用）"
+        required: false
+        default: "UCbc8fwhdUNlqi-J99ISYu4A"
+      role_id:
+        description: "メンションID"
+        required: false
+        default: "1506186376599834634"
+
+jobs:
+  fetch-playlists:
+    name: "再生リストを取得して Discord 通知"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. リポジトリをチェックアウト ──────────────────────
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # ── 2. Python セットアップ ─────────────────────────────
+      - name: "🐍 Python 3.12 セットアップ"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── 3. 依存パッケージインストール ──────────────────────
+      - name: "📦 依存パッケージインストール"
+        run: pip install -r requirements.txt
+
+      # ── 4. スクリプト実行 ──────────────────────────────────
+      - name: "▶️ fetch_playlists.py 実行"
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          CHANNEL_ID:      ${{ inputs.channel_id || secrets.CHANNEL_ID }}
+          MONGODB_URI:     ${{ secrets.MONGODB_URI }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_PLAYLIST_NOTICE }}
+          ROLE_ID:         ${{ inputs.role_id || secrets.ROLE_ID }}
+        run: python scripts/fetch_playlists.py
