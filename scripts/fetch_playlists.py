@@ -19,12 +19,14 @@ MongoDB コレクション: youtube_notifications.playlists
     CHANNEL_ID        : 対象チャンネル ID (UC〇〇 形式)
     MONGODB_URI       : MongoDB 接続文字列
     DISCORD_WEBHOOK   : Discord Webhook URL
+    ROLE_ID           : Discord ロール ID
 """
 
 import os
 import sys
 import argparse
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -45,6 +47,11 @@ YOUTUBE_PLAYLIST_PAGE  = "https://www.youtube.com/playlist?list="
 
 DISCORD_COLOR_INITIAL  = 0x3498DB   # 青  : 初回一括通知
 DISCORD_COLOR_NEW      = 0xFF0000   # 赤  : 新規再生リスト
+
+# Discord Webhook レート制限対策
+# 公式制限: 同一 Webhook で 30件/分 = 約2秒に1件
+DISCORD_SEND_INTERVAL  = 2.0        # 通常の送信間隔（秒）
+DISCORD_MAX_RETRIES    = 5          # 429 時の最大リトライ回数
 
 
 # ══════════════════════════════════════════════════════════════
@@ -72,14 +79,14 @@ def fetch_all_playlists(api_key: str, channel_id: str) -> list[dict]:
     チャンネルの公開再生リストを全件取得する（ページネーション対応）。
     戻り値: YouTube API の playlist リソースのリスト
     """
-    results     = []
-    next_token  = None
+    results    = []
+    next_token = None
 
     while True:
         params = {
             "part":       "snippet,contentDetails",
             "channelId":  channel_id,
-            "maxResults": 50,           # API の最大値
+            "maxResults": 50,
             "key":        api_key,
         }
         if next_token:
@@ -101,21 +108,21 @@ def fetch_all_playlists(api_key: str, channel_id: str) -> list[dict]:
 
 def build_playlist_doc(item: dict) -> dict:
     """YouTube API レスポンスの item から MongoDB 保存用ドキュメントを生成する。"""
-    snippet          = item.get("snippet", {})
-    content_details  = item.get("contentDetails", {})
-    playlist_id      = item["id"]
+    snippet         = item.get("snippet", {})
+    content_details = item.get("contentDetails", {})
+    playlist_id     = item["id"]
 
     return {
-        "playlistId":    playlist_id,
-        "channelId":     snippet.get("channelId", ""),
-        "title":         snippet.get("title", ""),
-        "description":   snippet.get("description", ""),
-        "thumbnailUrl":  (snippet.get("thumbnails", {}).get("high", {}) or {}).get("url"),
-        "videoCount":    content_details.get("itemCount", 0),
-        "publishedAt":   to_jst_str(snippet.get("publishedAt")),
-        "publishedRaw":  snippet.get("publishedAt"),
-        "notified":      False,
-        "fetchedAt":     datetime.now(JST).isoformat(),
+        "playlistId":   playlist_id,
+        "channelId":    snippet.get("channelId", ""),
+        "title":        snippet.get("title", ""),
+        "description":  snippet.get("description", ""),
+        "thumbnailUrl": (snippet.get("thumbnails", {}).get("high", {}) or {}).get("url"),
+        "videoCount":   content_details.get("itemCount", 0),
+        "publishedAt":  to_jst_str(snippet.get("publishedAt")),
+        "publishedRaw": snippet.get("publishedAt"),
+        "notified":     False,
+        "fetchedAt":    datetime.now(JST).isoformat(),
     }
 
 
@@ -176,7 +183,6 @@ def build_embed(doc: dict, color: int, label: str, roleID: str | None) -> dict:
             "inline": False,
         })
     if doc.get("description"):
-        # 長すぎる場合は先頭100文字に切り詰め
         desc = doc["description"][:100] + ("…" if len(doc["description"]) > 100 else "")
         fields.append({
             "name":   "説明",
@@ -185,12 +191,11 @@ def build_embed(doc: dict, color: int, label: str, roleID: str | None) -> dict:
         })
 
     embed = {
-        "content": f"<@&{roleID}>",   # ロールメンション
-        "title":  f"{doc.get('title', '（タイトル不明）')}",
+        "title":  doc.get("title", "（タイトル不明）"),
         "url":    YOUTUBE_PLAYLIST_PAGE + doc["playlistId"],
         "color":  color,
         "fields": fields,
-        "image" : {"url": doc.get("thumbnailUrl")},
+        "image":  {"url": doc.get("thumbnailUrl")},
         "footer": {"text": f"playlistId: {doc['playlistId']} | fetchedAt: {doc.get('fetchedAt', '')}"},
     }
     if doc.get("thumbnailUrl"):
@@ -199,16 +204,46 @@ def build_embed(doc: dict, color: int, label: str, roleID: str | None) -> dict:
     return embed
 
 
-def post_discord(webhook_url: str, doc: dict, color: int, label: str, roleID: str | None) -> None:
-    """Discord Webhook に再生リスト通知を送信する。"""
+def post_discord(
+    webhook_url: str,
+    doc: dict,
+    color: int,
+    label: str,
+    roleID: str | None,
+) -> None:
+    """
+    Discord Webhook に再生リスト通知を送信する。
+
+    レート制限対策:
+      - 429 (Too Many Requests) が返った場合は Retry-After ヘッダの秒数だけ
+        待機してリトライ（最大 DISCORD_MAX_RETRIES 回）
+      - 送信成功後は呼び出し元で DISCORD_SEND_INTERVAL 秒のスリープを行う
+    """
     payload = {
         "username": "YouTube Playlist Notifier",
-        "content": f"{f'<@&{roleID}>' if roleID else ''}",  # ロールメンション（あれば）
+        "content":  f"<@&{roleID}>" if roleID else "",
         "embeds":   [build_embed(doc, color, label, roleID)],
     }
-    resp = requests.post(webhook_url, json=payload, timeout=10)
-    resp.raise_for_status()
-    logger.info("Discord 通知送信: %s [%s]", doc["playlistId"], doc["title"][:30])
+
+    for attempt in range(1, DISCORD_MAX_RETRIES + 1):
+        resp = requests.post(webhook_url, json=payload, timeout=10)
+
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 5))
+            logger.warning(
+                "Discord レート制限 (429)。%.1f 秒後にリトライ [%d/%d]: %s",
+                retry_after, attempt, DISCORD_MAX_RETRIES, doc["playlistId"],
+            )
+            time.sleep(retry_after)
+            continue
+
+        resp.raise_for_status()
+        logger.info("Discord 通知送信: %s [%s]", doc["playlistId"], doc["title"][:30])
+        return
+
+    raise requests.RequestException(
+        f"Discord への送信が {DISCORD_MAX_RETRIES} 回失敗しました: {doc['playlistId']}"
+    )
 
 
 def post_summary(webhook_url: str, total: int, channel_id: str) -> None:
@@ -235,14 +270,13 @@ def parse_args():
     parser.add_argument("--channel-id", default=os.getenv("CHANNEL_ID"),      help="YouTube チャンネル ID (UC〇〇)")
     parser.add_argument("--mongo-uri",  default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
     parser.add_argument("--webhook",    default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
-    parser.add_argument("--role-id",    default=os.getenv("ROLE_ID"),  help="Discord ロール ID")
+    parser.add_argument("--role-id",    default=os.getenv("ROLE_ID"),          help="Discord ロール ID")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # ── 必須パラメータチェック ──
     missing = [k for k, v in {
         "api-key":    args.api_key,
         "channel-id": args.channel_id,
@@ -282,28 +316,40 @@ def main():
         doc         = build_playlist_doc(item)
         playlist_id = doc["playlistId"]
 
-        # DB に upsert（新規かどうか確認）
-        is_new = upsert_playlist(collection, doc)
+        upsert_playlist(collection, doc)
 
         if first_run:
             # 初回: 全件を青色で通知
             try:
-                post_discord(args.webhook, doc, color=DISCORD_COLOR_INITIAL, label="初回登録", roleID=args.role_id if hasattr(args, "role_id") else None)
+                post_discord(
+                    args.webhook, doc,
+                    color=DISCORD_COLOR_INITIAL, label="初回登録",
+                    roleID=args.role_id,
+                )
                 mark_notified(collection, playlist_id)
                 new_count += 1
             except requests.RequestException as e:
                 logger.error("Discord 通知失敗 (%s): %s", playlist_id, e)
+            finally:
+                # 成功・失敗問わず次の送信まで待機（レート制限対策）
+                time.sleep(DISCORD_SEND_INTERVAL)
 
         else:
-            # 通常: DB に存在しなかったもの（新規）だけ赤色で通知
+            # 通常: 新規のみ赤色で通知
             if playlist_id not in existing_ids:
                 logger.info("[新規再生リスト] %s - %s", playlist_id, doc["title"][:40])
                 try:
-                    post_discord(args.webhook, doc, color=DISCORD_COLOR_NEW, label="新規再生リスト", roleID=args.role_id if hasattr(args, "role_id") else None)
+                    post_discord(
+                        args.webhook, doc,
+                        color=DISCORD_COLOR_NEW, label="新規再生リスト",
+                        roleID=args.role_id,
+                    )
                     mark_notified(collection, playlist_id)
                     new_count += 1
                 except requests.RequestException as e:
                     logger.error("Discord 通知失敗 (%s): %s", playlist_id, e)
+                finally:
+                    time.sleep(DISCORD_SEND_INTERVAL)
             else:
                 logger.info("[既存] %s をスキップ", playlist_id)
 

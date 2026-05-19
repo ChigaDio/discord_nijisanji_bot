@@ -15,6 +15,7 @@ MongoDB に保存 → Discord に通知する。
     CHANNEL_ID        : 対象チャンネル ID (UC〇〇 形式)
     MONGODB_URI       : MongoDB 接続文字列
     DISCORD_WEBHOOK   : Discord Webhook URL
+    ROLE_ID           : Discord ロール ID
 """
 
 import os
@@ -22,6 +23,7 @@ import sys
 import argparse
 import re
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -42,6 +44,11 @@ YOUTUBE_VIDEOS_URL   = "https://www.googleapis.com/youtube/v3/videos"
 YOUTUBE_WATCH_URL    = "https://www.youtube.com/watch?v="
 
 DISCORD_COLOR_NEW    = 0xFF0000  # 赤: 新着
+
+# Discord Webhook レート制限対策
+# 公式制限: 同一 Webhook で 30件/分 = 約2秒に1件
+DISCORD_SEND_INTERVAL = 2.0      # 通常の送信間隔（秒）
+DISCORD_MAX_RETRIES   = 5        # 429 時の最大リトライ回数
 
 
 # ══════════════════════════════════════════════════════════════
@@ -145,7 +152,6 @@ def is_free_chat(item: dict) -> bool:
     )
     live_status = snippet.get("liveBroadcastContent", "none")
 
-    # 配信時刻情報がなく、配信終了済み = フリーチャット的な常設枠
     if not has_schedule and live_status == "none":
         return True
 
@@ -214,7 +220,7 @@ def upsert_video(collection, doc: dict) -> bool:
 # Discord
 # ══════════════════════════════════════════════════════════════
 
-def build_embed(doc: dict, color: int,roleID : str) -> dict:
+def build_embed(doc: dict, color: int, roleID: str) -> dict:
     type_label = {
         "live":  "🔴 ライブ配信",
         "short": "⚡ Shorts",
@@ -235,12 +241,9 @@ def build_embed(doc: dict, color: int,roleID : str) -> dict:
     embed = {
         "title":  doc.get("title", "（タイトル不明）"),
         "url":    YOUTUBE_WATCH_URL + doc["videoId"],
-        "content": f"<@&{roleID}>",   # ロールメンション
         "color":  color,
         "fields": fields,
-        "image": {
-                "url": f"https://img.youtube.com/vi/{doc['videoId']}/maxresdefault.jpg"
-            },
+        "image":  {"url": f"https://img.youtube.com/vi/{doc['videoId']}/maxresdefault.jpg"},
         "footer": {"text": f"fetchedAt: {doc.get('fetchedAt', '')}"},
     }
     if doc.get("thumbnailUrl"):
@@ -249,15 +252,45 @@ def build_embed(doc: dict, color: int,roleID : str) -> dict:
     return embed
 
 
-def post_discord(webhook_url: str, doc: dict, color: int = DISCORD_COLOR_NEW, roleID: str = None) -> None:
+def post_discord(
+    webhook_url: str,
+    doc: dict,
+    color: int = DISCORD_COLOR_NEW,
+    roleID: str = None,
+) -> None:
+    """
+    Discord Webhook に動画通知を送信する。
+
+    レート制限対策:
+      - 429 (Too Many Requests) が返った場合は Retry-After ヘッダの秒数だけ
+        待機してリトライ（最大 DISCORD_MAX_RETRIES 回）
+      - 送信成功後は呼び出し元で DISCORD_SEND_INTERVAL 秒のスリープを行う
+    """
     payload = {
         "username": "YouTube Notifier",
-        "content": f"{f'<@&{roleID}>' if roleID else ''}",  # ロールメンション（あれば）
+        "content":  f"<@&{roleID}>" if roleID else "",
         "embeds":   [build_embed(doc, color, roleID)],
     }
-    resp = requests.post(webhook_url, json=payload, timeout=10)
-    resp.raise_for_status()
-    logger.info("Discord 通知送信: %s [%s]", doc["videoId"], doc["type"])
+
+    for attempt in range(1, DISCORD_MAX_RETRIES + 1):
+        resp = requests.post(webhook_url, json=payload, timeout=10)
+
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 5))
+            logger.warning(
+                "Discord レート制限 (429)。%.1f 秒後にリトライ [%d/%d]: %s",
+                retry_after, attempt, DISCORD_MAX_RETRIES, doc["videoId"],
+            )
+            time.sleep(retry_after)
+            continue
+
+        resp.raise_for_status()
+        logger.info("Discord 通知送信: %s [%s]", doc["videoId"], doc["type"])
+        return
+
+    raise requests.RequestException(
+        f"Discord への送信が {DISCORD_MAX_RETRIES} 回失敗しました: {doc['videoId']}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -266,7 +299,7 @@ def post_discord(webhook_url: str, doc: dict, color: int = DISCORD_COLOR_NEW, ro
 
 def process_playlist(
     api_key, channel_id, playlist_prefix, video_type,
-    max_results, collection, webhook_url,roleID
+    max_results, collection, webhook_url, roleID
 ) -> int:
     """1種別分のプレイリストを取得・保存・通知。戻り値: 新規通知件数"""
     playlist_id = channel_id_to_playlist_id(channel_id, playlist_prefix)
@@ -299,12 +332,13 @@ def process_playlist(
                 post_discord(webhook_url, doc, color=DISCORD_COLOR_NEW, roleID=roleID)
                 collection.update_one(
                     {"videoId": vid},
-                    {"$set": {
-                        "notifiedAt": datetime.now(JST).isoformat(),
-                    }},
+                    {"$set": {"notifiedAt": datetime.now(JST).isoformat()}},
                 )
             except requests.RequestException as e:
                 logger.error("Discord 通知失敗 (%s): %s", vid, e)
+            finally:
+                # 成功・失敗問わず次の送信まで待機（レート制限対策）
+                time.sleep(DISCORD_SEND_INTERVAL)
         else:
             logger.info("[既存/%s] %s をスキップ", video_type, vid)
 
@@ -321,7 +355,7 @@ def parse_args():
     parser.add_argument("--channel-id",  default=os.getenv("CHANNEL_ID"),      help="YouTube チャンネル ID (UC〇〇)")
     parser.add_argument("--mongo-uri",   default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
     parser.add_argument("--webhook",     default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
-    parser.add_argument("--role-id",     default=os.getenv("ROLE_ID"),  help="Discord ロール ID")
+    parser.add_argument("--role-id",     default=os.getenv("ROLE_ID"),          help="Discord ロール ID")
     parser.add_argument("--max-results", type=int, default=5,                   help="各タブから取得する最大動画数 (default: 5)")
     return parser.parse_args()
 
@@ -334,7 +368,7 @@ def main():
         "channel-id": args.channel_id,
         "mongo-uri":  args.mongo_uri,
         "webhook":    args.webhook,
-        "role-id":    args.role_id, 
+        "role-id":    args.role_id,
     }.items() if not v]
     if missing:
         logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
@@ -342,7 +376,6 @@ def main():
 
     collection = get_collection(args.mongo_uri)
 
-    # (プレイリストプレフィックス, 種別名) の順で処理
     targets = [
         ("UULV", "live"),   # ライブ配信タブ → type: live
         ("UULF", "video"),  # 動画タブ       → type: video
@@ -360,7 +393,7 @@ def main():
                 max_results     = args.max_results,
                 collection      = collection,
                 webhook_url     = args.webhook,
-                roleID            = args.role_id
+                roleID          = args.role_id,
             )
             total_new += n
         except requests.RequestException as e:
