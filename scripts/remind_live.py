@@ -15,6 +15,7 @@ import sys
 import argparse
 import logging
 from datetime import datetime, timezone, timedelta
+import time
 
 import requests
 from pymongo import MongoClient
@@ -169,6 +170,15 @@ def post_discord(webhook_url: str, doc: dict, live_status: str, color: int, role
         "embeds":   [build_embed(doc, live_status, color, roleID)],
     }
     resp = requests.post(webhook_url, json=payload, timeout=10)
+    
+    if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 5))
+            logger.warning(
+                "Discord レート制限 (429)。%.1f 秒後にリトライ",
+                retry_after,
+            )
+            time.sleep(retry_after)
+            resp = requests.post(webhook_url, json=payload, timeout=10)
     resp.raise_for_status()
     logger.info("Discord リマインド送信: %s", doc["videoId"])
 
