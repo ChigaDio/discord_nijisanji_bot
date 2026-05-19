@@ -1,12 +1,18 @@
 """
 fetch_and_notify.py
 ====================
-YouTube Data API から指定チャンネルの最新動画を取得し、
+YouTube Data API のプレイリストエンドポイントを使い、
+種別ごと（ライブ / 動画 / Shorts）に正確に取得して
 MongoDB に保存 → Discord に通知する。
+
+チャンネルIDの UC〇〇 プレフィックスを以下に置換してプレイリストIDとして使用：
+    UULV〇〇  : ライブ配信タブ
+    UULF〇〇  : 動画タブ
+    UUSH〇〇  : Shortsタブ
 
 環境変数:
     YOUTUBE_API_KEY   : YouTube Data API v3 のキー
-    CHANNEL_ID        : 対象チャンネル ID
+    CHANNEL_ID        : 対象チャンネル ID (UC〇〇 形式)
     MONGODB_URI       : MongoDB 接続文字列
     DISCORD_WEBHOOK   : Discord Webhook URL
 """
@@ -19,7 +25,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 import requests
-from pymongo import MongoClient, errors as pymongo_errors
+from pymongo import MongoClient
 
 # ── ロガー設定 ──────────────────────────────────────────────
 logging.basicConfig(
@@ -31,19 +37,26 @@ logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
 
 # ── 定数 ────────────────────────────────────────────────────
-YOUTUBE_SEARCH_URL  = "https://www.googleapis.com/youtube/v3/search"
-YOUTUBE_VIDEOS_URL  = "https://www.googleapis.com/youtube/v3/videos"
-YOUTUBE_WATCH_URL   = "https://www.youtube.com/watch?v="
+YOUTUBE_PLAYLIST_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
+YOUTUBE_VIDEOS_URL   = "https://www.googleapis.com/youtube/v3/videos"
+YOUTUBE_WATCH_URL    = "https://www.youtube.com/watch?v="
 
-DISCORD_COLOR_NEW   = 0xFF0000  # 赤: 新着
-
-# Shorts 判定のしきい値（秒）
-SHORTS_MAX_DURATION = 60
+DISCORD_COLOR_NEW    = 0xFF0000  # 赤: 新着
 
 
 # ══════════════════════════════════════════════════════════════
 # ユーティリティ
 # ══════════════════════════════════════════════════════════════
+
+def channel_id_to_playlist_id(channel_id: str, prefix: str) -> str:
+    """
+    UC〇〇 → {prefix}〇〇 に変換してプレイリストIDを返す。
+    例: channel_id="UCabc", prefix="UULV" → "UULVabc"
+    """
+    if not channel_id.startswith("UC"):
+        raise ValueError(f"チャンネルIDが UC で始まっていません: {channel_id}")
+    return prefix + channel_id[2:]
+
 
 def parse_iso8601_duration(duration: str) -> int:
     """ISO 8601 duration (PT#M#S) を秒数に変換する。"""
@@ -61,7 +74,7 @@ def parse_iso8601_duration(duration: str) -> int:
     return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
-def to_jst_str(iso_str: str | None) -> str | None:
+def to_jst_str(iso_str):
     """UTC ISO 8601 文字列を JST の読みやすい文字列に変換する。"""
     if not iso_str:
         return None
@@ -77,65 +90,81 @@ def to_jst_str(iso_str: str | None) -> str | None:
 # YouTube API
 # ══════════════════════════════════════════════════════════════
 
-def fetch_latest_video_ids(api_key: str, channel_id: str, max_results: int = 10) -> list[str]:
-    """チャンネルの最新動画 ID 一覧を取得する。"""
+def fetch_playlist_video_ids(api_key: str, playlist_id: str, max_results: int = 5) -> list:
+    """
+    プレイリスト ID から最新の動画 ID 一覧を取得する。
+    プレイリストが存在しない場合は空リストを返す。
+    """
     params = {
-        "part":       "id",
-        "channelId":  channel_id,
+        "part":       "contentDetails",
+        "playlistId": playlist_id,
         "maxResults": max_results,
-        "order":      "date",
-        "type":       "video",
         "key":        api_key,
     }
-    resp = requests.get(YOUTUBE_SEARCH_URL, params=params, timeout=10)
+    resp = requests.get(YOUTUBE_PLAYLIST_URL, params=params, timeout=10)
+
+    if resp.status_code == 404:
+        logger.warning("プレイリストが存在しません（スキップ）: %s", playlist_id)
+        return []
+
     resp.raise_for_status()
     items = resp.json().get("items", [])
-    return [item["id"]["videoId"] for item in items]
+    return [item["contentDetails"]["videoId"] for item in items]
 
 
-def fetch_video_details(api_key: str, video_ids: list[str]) -> list[dict]:
+def fetch_video_details(api_key: str, video_ids: list) -> list:
     """動画 ID のリストから詳細情報を取得する。"""
     if not video_ids:
         return []
     params = {
-        "part":  "snippet,contentDetails,liveStreamingDetails",
-        "id":    ",".join(video_ids),
-        "key":   api_key,
+        "part": "snippet,contentDetails,liveStreamingDetails",
+        "id":   ",".join(video_ids),
+        "key":  api_key,
     }
     resp = requests.get(YOUTUBE_VIDEOS_URL, params=params, timeout=10)
     resp.raise_for_status()
     return resp.json().get("items", [])
 
 
-def classify_video(item: dict) -> dict:
+def is_free_chat(item: dict) -> bool:
     """
-    動画アイテムを解析し、MongoDB 保存用ドキュメントを返す。
-
-    type フィールド:
-        "live"    : ライブ配信中 / 配信予定
-        "short"   : YouTube Shorts (60 秒以内)
-        "video"   : 通常動画
+    フリーチャット枠を判定して除外する。
+    ・タイトルにフリーチャット系ワードを含む
+    ・scheduledStartTime も actualStartTime もなく配信終了済み
     """
-    snippet              = item.get("snippet", {})
-    content_details      = item.get("contentDetails", {})
-    live_details         = item.get("liveStreamingDetails", {})
+    snippet      = item.get("snippet", {})
+    live_details = item.get("liveStreamingDetails", {})
+    title        = snippet.get("title", "").lower()
 
-    video_id   = item["id"]
-    channel_id = snippet.get("channelId", "")
-    title      = snippet.get("title", "")
-    live_status = snippet.get("liveBroadcastContent", "none")  # "live" | "upcoming" | "none"
+    free_chat_keywords = ["フリーチャット", "free chat", "freechat", "待機所", "待機枠"]
+    if any(kw in title for kw in free_chat_keywords):
+        return True
 
-    duration_sec = parse_iso8601_duration(content_details.get("duration", "PT0S"))
+    has_schedule = bool(
+        live_details.get("scheduledStartTime") or live_details.get("actualStartTime")
+    )
+    live_status = snippet.get("liveBroadcastContent", "none")
 
-    # タイプ判定
-    if live_status in ("live", "upcoming"):
-        video_type = "live"
-    elif duration_sec <= SHORTS_MAX_DURATION and duration_sec > 0:
-        video_type = "short"
-    else:
-        video_type = "video"
+    # 配信時刻情報がなく、配信終了済み = フリーチャット的な常設枠
+    if not has_schedule and live_status == "none":
+        return True
 
-    # ライブの配信予定時刻 (JST)
+    return False
+
+
+def build_doc(item: dict, video_type: str) -> dict:
+    """
+    動画アイテムと確定済みの video_type から MongoDB 保存用ドキュメントを返す。
+    video_type: "live" | "video" | "short"  ← プレイリストタブで確定済み
+    """
+    snippet      = item.get("snippet", {})
+    live_details = item.get("liveStreamingDetails", {})
+
+    video_id    = item["id"]
+    channel_id  = snippet.get("channelId", "")
+    title       = snippet.get("title", "")
+    live_status = snippet.get("liveBroadcastContent", "none")
+
     scheduled_start_jst = None
     scheduled_start_raw = None
     if video_type == "live":
@@ -143,20 +172,23 @@ def classify_video(item: dict) -> dict:
         scheduled_start_raw = raw
         scheduled_start_jst = to_jst_str(raw)
 
-    doc = {
-        "videoId":            video_id,
-        "channelId":          channel_id,
-        "title":              title,
-        "type":               video_type,          # "live" | "short" | "video"
-        "liveStatus":         live_status,          # "live" | "upcoming" | "none"
-        "scheduledStartJST":  scheduled_start_jst,
-        "scheduledStartRaw":  scheduled_start_raw,
-        "durationSec":        duration_sec,
-        "thumbnailUrl":       (snippet.get("thumbnails", {}).get("high", {}) or {}).get("url"),
-        "notified":           False,
-        "fetchedAt":          datetime.now(JST).isoformat(),
+    duration_sec = parse_iso8601_duration(
+        item.get("contentDetails", {}).get("duration", "PT0S")
+    )
+
+    return {
+        "videoId":           video_id,
+        "channelId":         channel_id,
+        "title":             title,
+        "type":              video_type,
+        "liveStatus":        live_status,
+        "scheduledStartJST": scheduled_start_jst,
+        "scheduledStartRaw": scheduled_start_raw,
+        "durationSec":       duration_sec,
+        "thumbnailUrl":      (snippet.get("thumbnails", {}).get("high", {}) or {}).get("url"),
+        "notified":          False,
+        "fetchedAt":         datetime.now(JST).isoformat(),
     }
-    return doc
 
 
 # ══════════════════════════════════════════════════════════════
@@ -164,17 +196,12 @@ def classify_video(item: dict) -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def get_collection(uri: str):
-    """MongoDB コレクションを返す。"""
     client = MongoClient(uri, serverSelectionTimeoutMS=10000)
-    db     = client["youtube_notifications"]
-    return db["videos"]
+    return client["youtube_notifications"]["videos"]
 
 
 def upsert_video(collection, doc: dict) -> bool:
-    """
-    動画ドキュメントを upsert する。
-    戻り値: True = 新規挿入 / False = 既存更新
-    """
+    """upsert。戻り値: True = 新規 / False = 既存"""
     result = collection.update_one(
         {"videoId": doc["videoId"]},
         {"$setOnInsert": doc},
@@ -187,8 +214,7 @@ def upsert_video(collection, doc: dict) -> bool:
 # Discord
 # ══════════════════════════════════════════════════════════════
 
-def build_embed(doc: dict, color: int) -> dict:
-    """Discord Embed オブジェクトを生成する。"""
+def build_embed(doc: dict, color: int,roleID : str) -> dict:
     type_label = {
         "live":  "🔴 ライブ配信",
         "short": "⚡ Shorts",
@@ -196,7 +222,7 @@ def build_embed(doc: dict, color: int) -> dict:
     }.get(doc["type"], doc["type"])
 
     fields = [
-        {"name": "種別",      "value": type_label,     "inline": True},
+        {"name": "種別",       "value": type_label,       "inline": True},
         {"name": "チャンネル", "value": doc["channelId"], "inline": True},
     ]
     if doc.get("scheduledStartJST"):
@@ -207,11 +233,15 @@ def build_embed(doc: dict, color: int) -> dict:
         })
 
     embed = {
-        "title":       doc.get("title", "（タイトル不明）"),
-        "url":         YOUTUBE_WATCH_URL + doc["videoId"],
-        "color":       color,
-        "fields":      fields,
-        "footer":      {"text": f"fetchedAt: {doc.get('fetchedAt', '')}"},
+        "title":  doc.get("title", "（タイトル不明）"),
+        "url":    YOUTUBE_WATCH_URL + doc["videoId"],
+        "content": f"<@&{roleID}>",   # ロールメンション
+        "color":  color,
+        "fields": fields,
+        "image": {
+                "url": f"https://img.youtube.com/vi/{doc['videoId']}/maxresdefault.jpg"
+            },
+        "footer": {"text": f"fetchedAt: {doc.get('fetchedAt', '')}"},
     }
     if doc.get("thumbnailUrl"):
         embed["thumbnail"] = {"url": doc["thumbnailUrl"]}
@@ -219,83 +249,124 @@ def build_embed(doc: dict, color: int) -> dict:
     return embed
 
 
-def post_discord(webhook_url: str, doc: dict, color: int = DISCORD_COLOR_NEW) -> None:
-    """Discord Webhook に通知を送信する。"""
+def post_discord(webhook_url: str, doc: dict, color: int = DISCORD_COLOR_NEW, roleID: str = None) -> None:
     payload = {
         "username": "YouTube Notifier",
-        "embeds":   [build_embed(doc, color)],
+        "content": f"{f'<@&{roleID}>' if roleID else ''}",  # ロールメンション（あれば）
+        "embeds":   [build_embed(doc, color, roleID)],
     }
     resp = requests.post(webhook_url, json=payload, timeout=10)
     resp.raise_for_status()
-    logger.info("Discord 通知送信: %s", doc["videoId"])
+    logger.info("Discord 通知送信: %s [%s]", doc["videoId"], doc["type"])
 
 
 # ══════════════════════════════════════════════════════════════
-# メイン処理
+# プレイリストごとの処理
 # ══════════════════════════════════════════════════════════════
 
-def parse_args() -> argparse.Namespace:
+def process_playlist(
+    api_key, channel_id, playlist_prefix, video_type,
+    max_results, collection, webhook_url,roleID
+) -> int:
+    """1種別分のプレイリストを取得・保存・通知。戻り値: 新規通知件数"""
+    playlist_id = channel_id_to_playlist_id(channel_id, playlist_prefix)
+    logger.info("[%s] プレイリスト %s を取得中...", video_type, playlist_id)
+
+    video_ids = fetch_playlist_video_ids(api_key, playlist_id, max_results)
+    if not video_ids:
+        logger.info("[%s] 動画なし", video_type)
+        return 0
+
+    items     = fetch_video_details(api_key, video_ids)
+    new_count = 0
+
+    for item in items:
+        vid = item["id"]
+
+        # フリーチャット除外（ライブタブのみ）
+        if video_type == "live" and is_free_chat(item):
+            logger.info("[%s] フリーチャットをスキップ: %s / %s",
+                        video_type, vid, item.get("snippet", {}).get("title", "")[:30])
+            continue
+
+        doc    = build_doc(item, video_type)
+        is_new = upsert_video(collection, doc)
+
+        if is_new:
+            new_count += 1
+            logger.info("[新規/%s] %s - %s", video_type, vid, doc["title"][:40])
+            try:
+                post_discord(webhook_url, doc, color=DISCORD_COLOR_NEW, roleID=roleID)
+                collection.update_one(
+                    {"videoId": vid},
+                    {"$set": {
+                        "notifiedAt": datetime.now(JST).isoformat(),
+                    }},
+                )
+            except requests.RequestException as e:
+                logger.error("Discord 通知失敗 (%s): %s", vid, e)
+        else:
+            logger.info("[既存/%s] %s をスキップ", video_type, vid)
+
+    return new_count
+
+
+# ══════════════════════════════════════════════════════════════
+# メイン
+# ══════════════════════════════════════════════════════════════
+
+def parse_args():
     parser = argparse.ArgumentParser(description="YouTube → MongoDB → Discord 通知スクリプト")
-    parser.add_argument("--api-key",    default=os.getenv("YOUTUBE_API_KEY"),  help="YouTube Data API キー")
-    parser.add_argument("--channel-id", default=os.getenv("CHANNEL_ID"),       help="YouTube チャンネル ID")
-    parser.add_argument("--mongo-uri",  default=os.getenv("MONGODB_URI"),       help="MongoDB 接続文字列")
-    parser.add_argument("--webhook",    default=os.getenv("DISCORD_WEBHOOK"),   help="Discord Webhook URL")
-    parser.add_argument("--max-results", type=int, default=10,                  help="取得する最大動画数 (default: 10)")
+    parser.add_argument("--api-key",     default=os.getenv("YOUTUBE_API_KEY"), help="YouTube Data API キー")
+    parser.add_argument("--channel-id",  default=os.getenv("CHANNEL_ID"),      help="YouTube チャンネル ID (UC〇〇)")
+    parser.add_argument("--mongo-uri",   default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
+    parser.add_argument("--webhook",     default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
+    parser.add_argument("--role-id",     default=os.getenv("DISCORD_ROLE_ID"),  help="Discord ロール ID")
+    parser.add_argument("--max-results", type=int, default=5,                   help="各タブから取得する最大動画数 (default: 5)")
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
 
-    # ── 必須パラメータチェック ──
     missing = [k for k, v in {
         "api-key":    args.api_key,
         "channel-id": args.channel_id,
         "mongo-uri":  args.mongo_uri,
         "webhook":    args.webhook,
+        "role-id":    args.role_id, 
     }.items() if not v]
     if missing:
         logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
         sys.exit(1)
 
-    # ── YouTube → 動画 ID 取得 ──
-    logger.info("チャンネル %s の最新動画を取得中...", args.channel_id)
-    video_ids = fetch_latest_video_ids(args.api_key, args.channel_id, args.max_results)
-    logger.info("取得した動画 ID 数: %d", len(video_ids))
-
-    if not video_ids:
-        logger.info("動画が見つかりませんでした。終了します。")
-        return
-
-    # ── 動画詳細取得 ──
-    items = fetch_video_details(args.api_key, video_ids)
-    logger.info("詳細取得完了: %d 件", len(items))
-
-    # ── MongoDB 接続 ──
     collection = get_collection(args.mongo_uri)
 
-    # ── 各動画を処理 ──
-    new_count = 0
-    for item in items:
-        doc = classify_video(item)
-        is_new = upsert_video(collection, doc)
+    # (プレイリストプレフィックス, 種別名) の順で処理
+    targets = [
+        ("UULV", "live"),   # ライブ配信タブ → type: live
+        ("UULF", "video"),  # 動画タブ       → type: video
+        ("UUSH", "short"),  # Shortsタブ     → type: short
+    ]
 
-        if is_new:
-            new_count += 1
-            logger.info("[新規] %s (%s) type=%s", doc["videoId"], doc["title"][:30], doc["type"])
-            try:
-                post_discord(args.webhook, doc, color=DISCORD_COLOR_NEW)
-                # 通知済みフラグを更新
-                collection.update_one(
-                    {"videoId": doc["videoId"]},
-                    {"$set": {"notified": True, "notifiedAt": datetime.now(JST).isoformat()}},
-                )
-            except requests.RequestException as e:
-                logger.error("Discord 通知失敗 (%s): %s", doc["videoId"], e)
-        else:
-            logger.info("[既存] %s をスキップ", doc["videoId"])
+    total_new = 0
+    for prefix, vtype in targets:
+        try:
+            n = process_playlist(
+                api_key         = args.api_key,
+                channel_id      = args.channel_id,
+                playlist_prefix = prefix,
+                video_type      = vtype,
+                max_results     = args.max_results,
+                collection      = collection,
+                webhook_url     = args.webhook,
+                roleID            = args.role_id
+            )
+            total_new += n
+        except requests.RequestException as e:
+            logger.error("[%s] API エラー: %s", vtype, e)
 
-    logger.info("処理完了: 新規 %d 件 / 合計 %d 件", new_count, len(items))
+    logger.info("全処理完了: 新規通知 %d 件", total_new)
 
 
 if __name__ == "__main__":
