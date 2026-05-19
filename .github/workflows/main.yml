@@ -1,0 +1,41 @@
+name: "② ライブ配信リマインド通知 (5分ごと)"
+
+on:
+  # 手動実行も可能
+  workflow_dispatch:
+    inputs:
+      role_id:
+        description: "メンションID"
+        required: false
+        default: "1506186376599834634"
+
+jobs:
+  remind-live:
+    name: "配信予定ライブを再確認して Discord 通知"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # ── 1. リポジトリをチェックアウト ──────────────────────
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # ── 2. Python セットアップ ─────────────────────────────
+      - name: "🐍 Python 3.12 セットアップ"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── 3. 依存パッケージインストール ──────────────────────
+      - name: "📦 依存パッケージインストール"
+        run: pip install -r requirements.txt
+
+      # ── 4. スクリプト実行 ──────────────────────────────────
+      - name: "🔔 remind_live.py 実行"
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          MONGODB_URI:     ${{ secrets.MONGODB_URI }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_NOTICE }}
+          ROLE_ID:         ${{ inputs.role_id || secrets.ROLE_ID }}
+        run: python scripts/remind_live.py
