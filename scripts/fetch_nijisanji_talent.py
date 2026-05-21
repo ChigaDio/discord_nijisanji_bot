@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import os
 import sys
@@ -105,7 +106,8 @@ def build_embed(private_webhook_url, talent_name : str,talent_img_url: str | Non
         "url":    talent_details_url,
         "color":  color,
         "fields": fields,
-        "image":  {"url": private_img[0]} 
+        "image": {"url": private_img[1]} if private_img else None,
+        "thumbnail": {"url": private_img[0]} if private_img and private_img[0] else None,
     }
 
     return embed,private_img[0],private_img[1]
@@ -338,8 +340,9 @@ def main():
                             payload = {
                                 "username": "Nijisanji Talent Bot",
                                 "embeds":   [post],
-                            }
-                            res = requests.post(args.webhook, json=payload,timeout=10)
+
+                            }                           
+                            res = requests.post(args.webhook, json=payload, timeout=10)
                             if res.status_code == 429:
                                 logger.error(f"Failed to send webhook message for talent {name}")
                                 retry_after = float(res.headers.get("Retry-After", 5))
@@ -348,7 +351,7 @@ def main():
                                     retry_after,
                                 )
                                 time.sleep(retry_after)
-                                res = requests.post(args.webhook, json=payload)
+                                res = requests.post(args.webhook, json=payload, timeout=10)
                             # 新規追加
                             collection.insert_one({
                                 "name": name,
