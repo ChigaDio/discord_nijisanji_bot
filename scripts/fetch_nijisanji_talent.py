@@ -224,23 +224,15 @@ def main():
                     name = t["name"]
                     img_url = "https://www.nijisanji.jp/" + t["img_url"] if t["img_url"] else None
                     
-                    #mongodbで同じ名前のタレントがいるか確認して存在したらcontiniueする
-                    find_result = collection.find_one({"name": name})
-                    if find_result:
-                        logger.info(f"Talent already exists: {name}")
-                        continue
                     
                     try:
                         # MongoDBで既存データをチェック
                         existing = collection.find_one({"name": name})
-                        
-                        # --- 改善ポイント2: 既存チェックの集約 ---
-                        # 「全く未登録」か「登録済みだが画像URLなどの基本情報が変化している」場合のみ詳細ページにいく
-                        # ※もし「常に詳細ページの情報（説明文など）の更新をチェックしたい」場合は、このif文を外してください
-                        if existing and existing.get("img_url") == img_url:
-                            logger.info(f"Talent already exists and no change in list page, skipping: {name}")
+                        if existing:
+                            logger.info(f"Talent already exists: {name}")
                             continue
                         
+
                         # 一覧ページに戻っていることを確認して、インデックスを元に再度ボタンを取得（要素の生存エラー対策）
                         current_elements = page.query_selector_all('[data-testid="TalentItem"]')
                         if t["index"] >= len(current_elements):
