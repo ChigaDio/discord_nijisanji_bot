@@ -1,0 +1,36 @@
+name: "④ にじさんじタレント情報取得 & Discord 通知 (3日1回)"
+
+on:
+  # 手動実行も可能
+  workflow_dispatch:
+
+jobs:
+  fetch-and-notify:
+    name: "にじさんじタレント情報を取得して Discord 通知"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. リポジトリをチェックアウト ──────────────────────
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # ── 2. Python セットアップ ─────────────────────────────
+      - name: "🐍 Python 3.12 セットアップ"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── 3. 依存パッケージインストール ──────────────────────
+      - name: "📦 依存パッケージインストール"
+        run: pip install -r requirements.txt |
+             python -m playwright install --with-deps chromium
+
+      # ── 4. スクリプト実行 ──────────────────────────────────
+      - name: "▶️ fetch_nijisanji_talent.py 実行"
+        env:
+          MONGODB_URI:     ${{ secrets.MONGODB_URI }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_PLAYLIST_NOTICE }}
+        run: |
+          python scripts/fetch_nijisanji_talent.py
