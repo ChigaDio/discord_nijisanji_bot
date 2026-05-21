@@ -219,7 +219,13 @@ def main():
                         current_elements = page.query_selector_all('[data-testid="TalentItem"]')
                         if t["index"] >= len(current_elements):
                             logger.warning(f"Index out of range for talent {name}, skipping.")
-                            continue
+                            page.wait_for_load_state("networkidle")
+                            page.wait_for_timeout(2000)  # 2秒待機
+                            current_elements = page.query_selector_all('[data-testid="TalentItem"]')
+                            if t["index"] >= len(current_elements):
+                                logger.error(f"Still index out of range for talent {name} after retry, skipping.")
+                                continue
+                            
                         
                         button_elem = current_elements[t["index"]].query_selector("button")
                         if not button_elem:
