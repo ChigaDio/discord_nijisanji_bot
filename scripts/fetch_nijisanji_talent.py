@@ -243,7 +243,13 @@ def main():
                             page.wait_for_timeout(2000)  # 2秒待機
                             current_elements = page.query_selector_all('[data-testid="TalentItem"]')
                             if t["index"] >= len(current_elements):
+                                
                                 logger.error(f"Still index out of range for talent {name} after retry, skipping.")
+                                page.wait_for_selector('[data-testid="TalentItem"]', timeout=30000)  # タレントアイテムが現れるまで待つ
+                                current_elements = page.query_selector_all('[data-testid="TalentItem"]')
+                                if t["index"] >= len(current_elements):
+                                    logger.error(f"Index still out of range for talent {name} after waiting, skipping.")
+                                    continue
                                 continue
                             
                         
