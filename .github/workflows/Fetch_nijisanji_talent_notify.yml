@@ -33,5 +33,6 @@ jobs:
         env:
           MONGODB_URI:     ${{ secrets.MONGODB_URI }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_TALENT_NOTICE }}
+          DISCORD_WEBHOOK_PRIVATE_NOTICE: ${{ secrets.DISCORD_WEBHOOK_PRIVATE_NOTICE }}
         run: |
           python scripts/fetch_nijisanji_talent.py

@@ -82,9 +82,9 @@ def get_collection_talent(uri: str):
 # Discord
 # ══════════════════════════════════════════════════════════════
 
-def build_embed(talent_name : str,talent_img_url: str | None,talent_details_url: str | None, description: str | None, youtube_url : str | None, twitter_url : str | None,color: int) -> dict:
+def build_embed(private_webhook_url, talent_name : str,talent_img_url: str | None,talent_details_url: str | None, description: str | None, youtube_url : str | None, twitter_url : str | None,color: int) -> dict:
 
-
+    private_img = get_discord_cdn_url(private_webhook_url, talent_img_url) if talent_img_url else None
     fields = [
         {"name": "名前",       "value": talent_name,       "inline": False},
         {"name": "説明",   "value": description,       "inline": False},
@@ -96,10 +96,36 @@ def build_embed(talent_name : str,talent_img_url: str | None,talent_details_url:
         "url":    talent_details_url,
         "color":  color,
         "fields": fields,
-        "image":  {"url": talent_img_url} 
+        "image":  {"url": private_img} 
     }
 
     return embed
+
+def get_discord_cdn_url(webhook_url, image_url):
+    # 1. 画像をダウンロード
+    img_resp = requests.get(image_url)
+    img_data = img_resp.content
+    
+    # 2. 画像だけをWebhookで先に送る（ファイルアップロード）
+    # このメッセージはDiscord上に表示されるが、後で消すことも可能
+    files = {"file": ("talent.webp", img_data, "image/webp")}
+    response = requests.post(webhook_url, files=files)
+    
+    if response.status_code == 429:
+        retry_after = float(response.headers.get("Retry-After", 5))
+        logger.warning(
+            "Discord レート制限 (429)。%.1f 秒後にリトライ",
+            retry_after,
+        )
+        time.sleep(retry_after)
+        response = requests.post(webhook_url, files=files)
+    
+    # 3. Discordが発行した画像のURLを抜き出す
+    # 成功すると、レスポンスの attachments に画像URLが入っている
+    data = response.json()
+    if 'attachments' in data and len(data['attachments']) > 0:
+        return data['attachments'][0]['url']
+    return None
 
 
 
@@ -107,6 +133,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="YouTube → MongoDB → Discord 通知スクリプト")
     parser.add_argument("--mongo-uri",   default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
     parser.add_argument("--webhook",     default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
+    parser.add_argument("--private-webhook",     default=os.getenv("DISCORD_WEBHOOK_PRIVATE_NOTICE"), help="Discord Webhook URL（非公開チャンネル用）")
     return parser.parse_args()
 
 def main():
@@ -119,6 +146,7 @@ def main():
     missing = [k for k, v in {
         "mongo-uri":  args.mongo_uri,
         "webhook":    args.webhook,
+        "private-webhook": args.private_webhook
     }.items() if not v]
     if missing:
         logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
@@ -281,7 +309,7 @@ def main():
                             logger.info(f"Added new talent: {name}")
                             
                             #discordのbotに通知する処理
-                            post = build_embed(name, img_url, talent_url, description=description, youtube_url=youtube_url, twitter_url=twitter_url, color=change_color_code_int(color))
+                            post = build_embed(args.private_webhook, name, img_url, talent_url, description=description, youtube_url=youtube_url, twitter_url=twitter_url, color=change_color_code_int(color))
                             payload = {
                                 "username": "Nijisanji Talent Bot",
                                 "embeds":   [post],
