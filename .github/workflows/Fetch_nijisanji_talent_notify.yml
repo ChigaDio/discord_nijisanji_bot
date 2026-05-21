@@ -32,6 +32,6 @@ jobs:
       - name: "▶️ fetch_nijisanji_talent.py 実行"
         env:
           MONGODB_URI:     ${{ secrets.MONGODB_URI }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_PLAYLIST_NOTICE }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_TALENT_NOTICE }}
         run: |
           python scripts/fetch_nijisanji_talent.py

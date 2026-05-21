@@ -141,9 +141,11 @@ def main():
             
             try:
                 page.goto(url)
+                page.wait_for_load_state("networkidle")
                 # ページを一番下までスクロールして全てのタレントを読み込む
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(2000)  # 2秒待機
+                page.wait_for_load_state("networkidle")
                 
                 talent_elements = page.query_selector_all('[data-testid="TalentItem"]')
                 logger.info(f"Found {len(talent_elements)} talents for type {talent_type.value}")
@@ -153,6 +155,11 @@ def main():
                 for i, elem in enumerate(talent_elements):
                     img_elem = elem.query_selector("img")
                     img_url = img_elem.get_attribute("src") if img_elem else None
+                    if(img_elem == None or img_url == None):
+                        logger.warning(f"画像URLが見つかりませんでした。インデックス: {i}")
+                        page.wait_for_load_state("networkidle")
+                        img_elem = elem.query_selector("img")
+                        img_url = img_elem.get_attribute("src") if img_elem else None
                     
                     name_elem = elem.query_selector("p")
                     name = name_elem.inner_text().strip() if name_elem else None
