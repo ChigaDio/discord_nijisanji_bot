@@ -36,3 +36,6 @@ jobs:
           DISCORD_WEBHOOK_PRIVATE_NOTICE: ${{ secrets.DISCORD_WEBHOOK_PRIVATE_NOTICE }}
         run: |
           python scripts/fetch_nijisanji_talent.py
+          python scripts/fetch_nijisanji_talent.py 
+
+      
