@@ -25,9 +25,9 @@ URL = "https://www.nijisanji.jp/talents?filter="
 
 # ── タレントの種類 ─────────────────────────────────────────────
 class TalentType(enum.Enum):
+    VIRTUALREAL  = "virtuareal"
     NIJISANJI_JP = "nijisanji"
     NIJISANJI_EN = "nijisanjien"
-    VIRTUALREAL  = "virtuareal"
     
 # ── 汎用 ─────────────────────────────────────────────
 def change_color_code(color: str | None) -> str | None:
@@ -82,35 +82,51 @@ def get_collection_talent(uri: str):
 # Discord
 # ══════════════════════════════════════════════════════════════
 
-def build_embed(private_webhook_url, talent_name : str,talent_img_url: str | None,talent_details_url: str | None, description: str | None, youtube_url : str | None, twitter_url : str | None,talent_type: TalentType,text_color: str | None,color: int) -> dict:
+def build_embed(private_webhook_url, talent_name : str,talent_img_url: str | None, gallery_url: str | None,talent_details_url: str | None, description: str | None, youtube_url : str | None, twitter_url : str | None,bilibili_url : str | None,talent_type: TalentType,text_color: str | None,color: int) -> dict:
 
-    private_img = get_discord_cdn_url(private_webhook_url, talent_img_url) if talent_img_url else None
+    private_img = get_discord_cdn_url(private_webhook_url, talent_name, talent_img_url, gallery_url) if talent_img_url else None
+    # 1. 基本となるリストを作る
     fields = [
         {"name": "名前",       "value": talent_name,       "inline": True},
         {"name": "カラーコード", "value": text_color,        "inline": True},
         {"name": "所属", "value": talent_type.value, "inline": False},
         {"name": "説明",   "value": description,       "inline": False},
-        {"name": "YouTube",   "value": youtube_url,       "inline": True},
-        {"name": "Twitter",   "value": twitter_url,       "inline": True},
     ]
+
+    # 2. 条件付きで追加していく
+    if youtube_url:
+        fields.append({"name": "YouTube",  "value": youtube_url,  "inline": True})
+    if twitter_url:
+        fields.append({"name": "Twitter",  "value": twitter_url,  "inline": True})
+    if bilibili_url:
+        fields.append({"name": "Bilibili", "value": bilibili_url, "inline": True})
     embed = {
         "title":  talent_name,
         "url":    talent_details_url,
         "color":  color,
         "fields": fields,
-        "image":  {"url": private_img} 
+        "image":  {"url": private_img[0]} 
     }
 
-    return embed
+    return embed,private_img[0],private_img[1]
 
-def get_discord_cdn_url(webhook_url, image_url):
+def get_discord_cdn_url(webhook_url,talent_name, image_url,gallery_url=None):
     # 1. 画像をダウンロード
     img_resp = requests.get(image_url)
     img_data = img_resp.content
     
+    gallery_resp = requests.get(gallery_url) if gallery_url else None
+    gallery_data = gallery_resp.content 
+    
+    
     # 2. 画像だけをWebhookで先に送る（ファイルアップロード）
     # このメッセージはDiscord上に表示されるが、後で消すことも可能
-    files = {"file": ("talent.webp", img_data, "image/webp")}
+    files = {
+                "payload_json": (None, '{"content": "' + talent_name + '"}', 'application/json'),
+                "file1": ("talent.webp", img_data, "image/webp"),
+                "file2": ("gallery.webp", gallery_data, "image/webp")} if gallery_data else {"file1": ("talent.webp", img_data, "image/webp")}
+    
+
     response = requests.post(webhook_url, files=files)
     
     if response.status_code == 429:
@@ -126,7 +142,7 @@ def get_discord_cdn_url(webhook_url, image_url):
     # 成功すると、レスポンスの attachments に画像URLが入っている
     data = response.json()
     if 'attachments' in data and len(data['attachments']) > 0:
-        return data['attachments'][0]['url']
+        return data['attachments'][0]['url'],data['attachments'][1]['url']
     return None
 
 
@@ -171,11 +187,11 @@ def main():
             
             try:
                 page.goto(url)
-                page.wait_for_load_state("networkidle")
+                page.wait_for_load_state("domcontentloaded")
                 # ページを一番下までスクロールして全てのタレントを読み込む
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(2000)  # 2秒待機
-                page.wait_for_load_state("networkidle")
+                page.wait_for_load_state("domcontentloaded")
                 
                 talent_elements = page.query_selector_all('[data-testid="TalentItem"]')
                 logger.info(f"Found {len(talent_elements)} talents for type {talent_type.value}")
@@ -221,7 +237,7 @@ def main():
                         current_elements = page.query_selector_all('[data-testid="TalentItem"]')
                         if t["index"] >= len(current_elements):
                             logger.warning(f"Index out of range for talent {name}, skipping.")
-                            page.wait_for_load_state("networkidle")
+                            page.wait_for_load_state("domcontentloaded")
                             page.wait_for_timeout(2000)  # 2秒待機
                             current_elements = page.query_selector_all('[data-testid="TalentItem"]')
                             if t["index"] >= len(current_elements):
@@ -243,6 +259,12 @@ def main():
 
                         # さらに、情報が詰まっている「説明文のクラス」が画面に現れるまでピンポイントで待つ
                         page.wait_for_selector('[class^="liver-profile_liverDescription__"]', timeout=5000)
+                        
+                        #全身画像も取得 classのswiper-slide swiper-slide-active gallery-modal_swiperSlide__As75yの下にある要素imgから
+                        
+                        gallary_elem = page.query_selector('.swiper-slide.swiper-slide-active.gallery-modal_swiperSlide__As75y img')
+                        gallary_url = gallary_elem.get_attribute("src") if gallary_elem else None
+                        gallery_url = "https://www.nijisanji.jp/" + gallary_url if gallary_url else None
                         
                         # --- 詳細ページからの情報取得 ---
                         # 色の取得
@@ -267,6 +289,7 @@ def main():
                         youtube_url = None
                         youtube_channel_id = None
                         twitter_url = None
+                        bilibili_url = None
                         for sns_elem in sns_elements:
                             href = sns_elem.get_attribute("href")
                             if not href:
@@ -277,7 +300,8 @@ def main():
                                     youtube_channel_id = href.split("channel/")[-1]
                             elif "twitter.com" in href or "x.com" in href:
                                 twitter_url = href  
-                        
+                            elif "bilibili.com" in href:
+                                bilibili_url = href
                         # --- 改善ポイント3: データベースへの保存・更新ロジックの整理 ---
                         if existing:
                             # 変更があるかチェック
@@ -287,7 +311,8 @@ def main():
                                 existing.get("description") != description or
                                 existing.get("youtube_url") != youtube_url or
                                 existing.get("youtube_channel_id") != youtube_channel_id or
-                                existing.get("twitter_url") != twitter_url  or 
+                                existing.get("twitter_url") != twitter_url or
+                                existing.get("bilibili_url") != bilibili_url or
                                 existing.get("type") != talent_type.value):
                                 
                                 collection.update_one({"_id": existing["_id"]}, {"$set": {
@@ -298,6 +323,7 @@ def main():
                                     "youtube_url": youtube_url,
                                     "youtube_channel_id": youtube_channel_id,
                                     "twitter_url": twitter_url,
+                                    "bilibili_url": bilibili_url,
                                     "type": talent_type.value,
                                     "updated_at": datetime.now(JST),
                                 }})
@@ -305,23 +331,10 @@ def main():
                             else:
                                 logger.info(f"No changes for talent: {name}")
                         else:
-                            # 新規追加
-                            collection.insert_one({
-                                "name": name,
-                                "img_url": img_url,
-                                "talent_url": talent_url,
-                                "color": text_color,
-                                "description": description,
-                                "youtube_url": youtube_url,
-                                "youtube_channel_id": youtube_channel_id,
-                                "twitter_url": twitter_url,
-                                "type": talent_type.value,
-                                "created_at": datetime.now(JST),
-                            })
-                            logger.info(f"Added new talent: {name}")
                             
                             #discordのbotに通知する処理
-                            post = build_embed(args.private_webhook, name, img_url, talent_url, description=description, youtube_url=youtube_url, twitter_url=twitter_url, talent_type=talent_type, text_color=text_color, color=change_color_code_int(color))
+                            
+                            post, talent_img_url, gallery_url = build_embed(args.private_webhook, name, img_url, gallery_url, talent_url, description=description, youtube_url=youtube_url, twitter_url=twitter_url, bilibili_url=bilibili_url, talent_type=talent_type, text_color=text_color, color=change_color_code_int(color))
                             payload = {
                                 "username": "Nijisanji Talent Bot",
                                 "embeds":   [post],
@@ -336,10 +349,28 @@ def main():
                                 )
                                 time.sleep(retry_after)
                                 res = requests.post(args.webhook, json=payload)
+                            # 新規追加
+                            collection.insert_one({
+                                "name": name,
+                                "img_url": talent_img_url,
+                                "gallery_url": gallery_url,
+                                "talent_url": talent_url,
+                                "color": text_color,
+                                "description": description,
+                                "youtube_url": youtube_url,
+                                "youtube_channel_id": youtube_channel_id,
+                                "twitter_url": twitter_url,
+                                "bilibili_url": bilibili_url,
+                                "type": talent_type.value,
+                                "created_at": datetime.now(JST),
+                            })
+                            logger.info(f"Added new talent: {name}")
+                            
+
                         # 一覧ページに戻る
                         page.go_back()
                         page.wait_for_load_state("domcontentloaded")
-                        page.wait_for_timeout(3000)  # 3秒待機
+
 
                     except Exception as detail_e:
                         logger.error(f"Error processing talent {name}: {detail_e}")
