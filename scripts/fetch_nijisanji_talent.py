@@ -224,6 +224,12 @@ def main():
                     name = t["name"]
                     img_url = "https://www.nijisanji.jp/" + t["img_url"] if t["img_url"] else None
                     
+                    #mongodbで同じ名前のタレントがいるか確認して存在したらcontiniueする
+                    find_result = collection.find_one({"name": name})
+                    if find_result:
+                        logger.info(f"Talent already exists: {name}")
+                        continue
+                    
                     try:
                         # MongoDBで既存データをチェック
                         existing = collection.find_one({"name": name})
