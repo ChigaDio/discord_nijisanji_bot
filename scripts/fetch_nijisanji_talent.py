@@ -307,7 +307,7 @@ def main():
                         # --- 改善ポイント3: データベースへの保存・更新ロジックの整理 ---
                         if existing:
                             # 変更があるかチェック
-                            if (existing.get("img_url") != img_url or
+                            if (
                                 existing.get("talent_url") != talent_url or
                                 existing.get("color") != text_color or
                                 existing.get("description") != description or
@@ -318,7 +318,6 @@ def main():
                                 existing.get("type") != talent_type.value):
                                 
                                 collection.update_one({"_id": existing["_id"]}, {"$set": {
-                                    "img_url": img_url,
                                     "talent_url": talent_url,
                                     "color": text_color,
                                     "description": description,
