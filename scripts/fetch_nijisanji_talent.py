@@ -82,11 +82,13 @@ def get_collection_talent(uri: str):
 # Discord
 # ══════════════════════════════════════════════════════════════
 
-def build_embed(private_webhook_url, talent_name : str,talent_img_url: str | None,talent_details_url: str | None, description: str | None, youtube_url : str | None, twitter_url : str | None,color: int) -> dict:
+def build_embed(private_webhook_url, talent_name : str,talent_img_url: str | None,talent_details_url: str | None, description: str | None, youtube_url : str | None, twitter_url : str | None,talent_type: TalentType,text_color: str | None,color: int) -> dict:
 
     private_img = get_discord_cdn_url(private_webhook_url, talent_img_url) if talent_img_url else None
     fields = [
-        {"name": "名前",       "value": talent_name,       "inline": False},
+        {"name": "名前",       "value": talent_name,       "inline": True},
+        {"name": "カラーコード", "value": text_color,        "inline": True},
+        {"name": "所属", "value": talent_type.value, "inline": False},
         {"name": "説明",   "value": description,       "inline": False},
         {"name": "YouTube",   "value": youtube_url,       "inline": True},
         {"name": "Twitter",   "value": twitter_url,       "inline": True},
@@ -254,6 +256,7 @@ def main():
                                 color = color_style[start:end]
                             except ValueError:
                                 logger.warning(f"色のパースに失敗しました: {color_style}")
+                        text_color = change_color_code(color)
                                 
                         # 説明の取得
                         description_elem = page.query_selector('[class^="liver-profile_liverDescription__"]')
@@ -280,20 +283,22 @@ def main():
                             # 変更があるかチェック
                             if (existing.get("img_url") != img_url or
                                 existing.get("talent_url") != talent_url or
-                                existing.get("color") != color or
+                                existing.get("color") != text_color or
                                 existing.get("description") != description or
                                 existing.get("youtube_url") != youtube_url or
                                 existing.get("youtube_channel_id") != youtube_channel_id or
-                                existing.get("twitter_url") != twitter_url  ):
+                                existing.get("twitter_url") != twitter_url  or 
+                                existing.get("type") != talent_type.value):
                                 
                                 collection.update_one({"_id": existing["_id"]}, {"$set": {
                                     "img_url": img_url,
                                     "talent_url": talent_url,
-                                    "color": color,
+                                    "color": text_color,
                                     "description": description,
                                     "youtube_url": youtube_url,
                                     "youtube_channel_id": youtube_channel_id,
                                     "twitter_url": twitter_url,
+                                    "type": talent_type.value,
                                     "updated_at": datetime.now(JST),
                                 }})
                                 logger.info(f"Updated talent: {name}")
@@ -305,17 +310,18 @@ def main():
                                 "name": name,
                                 "img_url": img_url,
                                 "talent_url": talent_url,
-                                "color": color,
+                                "color": text_color,
                                 "description": description,
                                 "youtube_url": youtube_url,
                                 "youtube_channel_id": youtube_channel_id,
                                 "twitter_url": twitter_url,
+                                "type": talent_type.value,
                                 "created_at": datetime.now(JST),
                             })
                             logger.info(f"Added new talent: {name}")
                             
                             #discordのbotに通知する処理
-                            post = build_embed(args.private_webhook, name, img_url, talent_url, description=description, youtube_url=youtube_url, twitter_url=twitter_url, color=change_color_code_int(color))
+                            post = build_embed(args.private_webhook, name, img_url, talent_url, description=description, youtube_url=youtube_url, twitter_url=twitter_url, talent_type=talent_type, text_color=text_color, color=change_color_code_int(color))
                             payload = {
                                 "username": "Nijisanji Talent Bot",
                                 "embeds":   [post],
