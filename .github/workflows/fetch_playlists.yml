@@ -6,15 +6,6 @@ on:
     - cron: "0 0 * * *"
   # 手動実行（初回セットアップ時などに使用）
   workflow_dispatch:
-    inputs:
-      channel_id:
-        description: "YouTube チャンネル ID（省略時は Secrets の値を使用）"
-        required: false
-        default: "UCbc8fwhdUNlqi-J99ISYu4A"
-      role_id:
-        description: "メンションID"
-        required: false
-        default: "1506186376599834634"
 
 jobs:
   fetch-playlists:

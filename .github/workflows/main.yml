@@ -3,11 +3,6 @@ name: "② ライブ配信リマインド通知 (5分ごと)"
 on:
   # 手動実行も可能
   workflow_dispatch:
-    inputs:
-      role_id:
-        description: "メンションID"
-        required: false
-        default: "1506186376599834634"
 
 jobs:
   remind-live:
