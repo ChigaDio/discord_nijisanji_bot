@@ -191,7 +191,7 @@ def main():
                     text = accordion_body.inner_text().strip()
                     #発売日の正規表現
                     # (\d{4}年)? で「年」があってもなくてもOKにする
-                    pattern = r"((\d{4}年)?\d{1,2}月\d{1,2}日\([月火水木金土日]\)\d{1,2}:\d{2})\s*～\s*((\d{4}年)?\d{1,2}月\d{1,2}日\([月火水木金土日]\)\d{1,2}:\d{2})"
+                    pattern = r"((?:\d{4}年)?\d{1,2}月\d{1,2}日\([月火水木金土日]\)\d{1,2}:\d{2})\s*～\s*((?:\d{4}年)?\d{1,2}月\d{1,2}日\([月火水木金土日]\)\d{1,2}:\d{2})"
                     match = re.search(pattern, text)
                     if match:
                         release_date = match.group(1)
@@ -215,6 +215,7 @@ def main():
                     "livers": liver_list,
                     "categories": tag_list,
                     "release_date": release_date,
+                    "end_date": end_date,
                     "description": description,
                     "created_at": created_at
                 })
