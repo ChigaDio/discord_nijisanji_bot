@@ -12,10 +12,10 @@ MongoDB に保存 → Discord に通知する。
 
 環境変数:
     YOUTUBE_API_KEY   : YouTube Data API v3 のキー
-    CHANNEL_ID        : 対象チャンネル ID (UC〇〇 形式)
     MONGODB_URI       : MongoDB 接続文字列
-    DISCORD_WEBHOOK   : Discord Webhook URL
-    ROLE_ID           : Discord ロール ID
+
+データベース:
+    nijisanji.talents に role_id, youtube_channel_id, webhook_url を保持していること
 """
 
 import os
@@ -201,9 +201,27 @@ def build_doc(item: dict, video_type: str) -> dict:
 # MongoDB
 # ══════════════════════════════════════════════════════════════
 
+def get_db(uri: str):
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+    return client
+
+
 def get_collection(uri: str):
     client = MongoClient(uri, serverSelectionTimeoutMS=10000)
     return client["youtube_notifications"]["videos"]
+
+
+def get_talents(client) -> list[dict]:
+    db = client["nijisanji"]
+    return list(db["talents"].find({}))
+
+
+def is_valid_talent(talent: dict) -> bool:
+    return bool(
+        talent.get("youtube_channel_id") and
+        talent.get("webhook_url") and
+        talent.get("role_id")
+    )
 
 
 def upsert_video(collection, doc: dict) -> bool:
@@ -351,30 +369,24 @@ def process_playlist(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="YouTube → MongoDB → Discord 通知スクリプト")
-    parser.add_argument("--api-key",     default=os.getenv("YOUTUBE_API_KEY"), help="YouTube Data API キー")
-    parser.add_argument("--channel-id",  default=os.getenv("CHANNEL_ID"),      help="YouTube チャンネル ID (UC〇〇)")
-    parser.add_argument("--mongo-uri",   default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
-    parser.add_argument("--webhook",     default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
-    parser.add_argument("--role-id",     default=os.getenv("ROLE_ID"),          help="Discord ロール ID")
-    parser.add_argument("--max-results", type=int, default=5,                   help="各タブから取得する最大動画数 (default: 5)")
+    parser.add_argument("--api-key",   default=os.getenv("YOUTUBE_API_KEY"), help="YouTube Data API キー")
+    parser.add_argument("--mongo-uri", default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
+    parser.add_argument("--max-results", type=int, default=5,                 help="各タブから取得する最大動画数 (default: 5)")
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def process_talent_videos(talent: dict, api_key: str, collection, max_results: int) -> int:
+    role_id    = talent.get("role_id")
+    webhook    = talent.get("webhook_url")
+    channel_id = talent.get("youtube_channel_id")
 
-    missing = [k for k, v in {
-        "api-key":    args.api_key,
-        "channel-id": args.channel_id,
-        "mongo-uri":  args.mongo_uri,
-        "webhook":    args.webhook,
-        "role-id":    args.role_id,
-    }.items() if not v]
-    if missing:
-        logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
-        sys.exit(1)
-
-    collection = get_collection(args.mongo_uri)
+    if not is_valid_talent(talent):
+        logger.warning(
+            "Talent %s をスキップします。必須フィールド不足: %s",
+                talent.get("name"),
+            {"id": talent.get("_id"), "channel_id": channel_id, "role_id": role_id, "webhook_url": webhook},
+        )
+        return 0
 
     targets = [
         ("UULV", "live"),   # ライブ配信タブ → type: live
@@ -382,24 +394,49 @@ def main():
         ("UUSH", "short"),  # Shortsタブ     → type: short
     ]
 
-    total_new = 0
+    talent_count = 0
     for prefix, vtype in targets:
         try:
             n = process_playlist(
-                api_key         = args.api_key,
-                channel_id      = args.channel_id,
+                api_key         = api_key,
+                channel_id      = channel_id,
                 playlist_prefix = prefix,
                 video_type      = vtype,
-                max_results     = args.max_results,
+                max_results     = max_results,
                 collection      = collection,
-                webhook_url     = args.webhook,
-                roleID          = args.role_id,
+                webhook_url     = webhook,
+                roleID          = role_id,
             )
-            total_new += n
+            talent_count += n
         except requests.RequestException as e:
-            logger.error("[%s] API エラー: %s", vtype, e)
+            logger.error("[%s/%s] API エラー: %s", channel_id, vtype, e)
+    return talent_count
 
-    logger.info("全処理完了: 新規通知 %d 件", total_new)
+
+def main():
+    args = parse_args()
+
+    missing = [k for k, v in {
+        "api-key":   args.api_key,
+        "mongo-uri": args.mongo_uri,
+    }.items() if not v]
+    if missing:
+        logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
+        sys.exit(1)
+
+    client     = get_db(args.mongo_uri)
+    talents    = get_talents(client)
+    collection = get_collection(args.mongo_uri)
+
+    if not talents:
+        logger.info("talents が見つかりません。終了します。")
+        return
+
+    total_new = 0
+    for talent in talents:
+        total_new += process_talent_videos(talent, args.api_key, collection, args.max_results)
+
+    logger.info("全talent処理完了: 新規通知 %d 件", total_new)
 
 
 if __name__ == "__main__":

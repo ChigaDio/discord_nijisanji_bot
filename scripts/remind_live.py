@@ -86,20 +86,32 @@ def get_live_status(item: dict) -> tuple[str, str | None]:
 # MongoDB
 # ══════════════════════════════════════════════════════════════
 
-def get_collection(uri: str):
-    """MongoDB コレクションを返す。"""
+def get_db(uri: str):
+    """MongoDB データベースを返す。"""
     client = MongoClient(uri, serverSelectionTimeoutMS=10000)
-    db     = client["youtube_notifications"]
+    return client
+
+
+def get_talents(client) -> list[dict]:
+    """nijisanji データベースの talents コレクションを返す。"""
+    db = client["nijisanji"]
+    return list(db["talents"].find({}))
+
+
+def get_video_collection(client):
+    """YouTube 通知用 videos コレクションを返す。"""
+    db = client["youtube_notifications"]
     return db["videos"]
 
 
-def fetch_unnotified_lives(collection) -> list[dict]:
+def fetch_unnotified_lives_by_channel(collection, channel_id: str) -> list[dict]:
     """
-    type == "live" かつ notified == False のドキュメントを返す。
+    channelId が一致し、type == "live" かつ notified == False のドキュメントを返す。
     """
     cursor = collection.find({
-        "type":     "live",
-        "notified": False,
+        "type":      "live",
+        "notified":  False,
+        "channelId": channel_id,
     })
     return list(cursor)
 
@@ -147,7 +159,6 @@ def build_embed(doc: dict, live_status: str, color: int, roleID: str | None) -> 
 
     embed = {
         "title":  f"【リマインド】{doc.get('title', '（タイトル不明）')}",
-        "content": f"{f'<@&{roleID}>' if roleID else ''}",  # ロールメンション（あれば）
         "url":    YOUTUBE_WATCH_URL + doc["videoId"],
         "color":  color,
         "fields": fields,
@@ -166,19 +177,19 @@ def post_discord(webhook_url: str, doc: dict, live_status: str, color: int, role
     """Discord Webhook に通知を送信する。"""
     payload = {
         "username": "YouTube Live Reminder",
-        "content": f"{f'<@&{roleID}>' if roleID else ''}",  # ロールメンション（あれば）
+        "content":  f"<@&{roleID}>" if roleID else "",
         "embeds":   [build_embed(doc, live_status, color, roleID)],
     }
     resp = requests.post(webhook_url, json=payload, timeout=10)
-    
+
     if resp.status_code == 429:
-            retry_after = float(resp.headers.get("Retry-After", 5))
-            logger.warning(
-                "Discord レート制限 (429)。%.1f 秒後にリトライ",
-                retry_after,
-            )
-            time.sleep(retry_after)
-            resp = requests.post(webhook_url, json=payload, timeout=10)
+        retry_after = float(resp.headers.get("Retry-After", 5))
+        logger.warning(
+            "Discord レート制限 (429)。%.1f 秒後にリトライ",
+            retry_after,
+        )
+        time.sleep(retry_after)
+        resp = requests.post(webhook_url, json=payload, timeout=10)
     resp.raise_for_status()
     logger.info("Discord リマインド送信: %s", doc["videoId"])
 
@@ -191,43 +202,37 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ライブ配信リマインド通知スクリプト")
     parser.add_argument("--api-key",   default=os.getenv("YOUTUBE_API_KEY"), help="YouTube Data API キー")
     parser.add_argument("--mongo-uri", default=os.getenv("MONGODB_URI"),     help="MongoDB 接続文字列")
-    parser.add_argument("--webhook",   default=os.getenv("DISCORD_WEBHOOK"), help="Discord Webhook URL")
-    parser.add_argument("--role-id",   default=os.getenv("ROLE_ID"), help="Discord ロール ID")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def process_talent(talent: dict, collection, api_key: str) -> int:
+    """Talents ドキュメントごとに該当チャンネルの未通知ライブを処理する。"""
+    role_id   = talent.get("role_id")
+    webhook   = talent.get("webhook_url")
+    channel_id = talent.get("youtube_channel_id")
 
-    # ── 必須パラメータチェック ──
-    missing = [k for k, v in {
-        "api-key":   args.api_key,
-        "mongo-uri": args.mongo_uri,
-        "webhook":   args.webhook,
-        "role-id":   args.role_id,
-    }.items() if not v]
-    if missing:
-        logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
-        sys.exit(1)
+    if not webhook or not role_id or not channel_id:
+        logger.warning(
+            "Talent %s をスキップします。必須フィールド不足: %s",
+            talent.get("name"),
+            {"id": talent.get("_id"), "channel_id": channel_id, "role_id": role_id, "webhook_url": webhook},
+        )
+        return 0
 
-    # ── MongoDB から未通知ライブを取得 ──
-    collection = get_collection(args.mongo_uri)
-    unnotified = fetch_unnotified_lives(collection)
-    logger.info("未通知ライブ件数: %d", len(unnotified))
+    unnotified = fetch_unnotified_lives_by_channel(collection, channel_id)
+    logger.info("%s の未通知ライブ件数: %d", channel_id, len(unnotified))
 
     if not unnotified:
-        logger.info("リマインド対象なし。終了します。")
-        return
+        return 0
 
-    # ── YouTube API で最新ステータスを確認 ──
     video_ids = [doc["videoId"] for doc in unnotified]
-    items      = fetch_video_details(args.api_key, video_ids)
-    item_map   = {item["id"]: item for item in items}
+    items     = fetch_video_details(api_key, video_ids)
+    item_map  = {item["id"]: item for item in items}
 
     remind_count = 0
     for doc in unnotified:
-        vid   = doc["videoId"]
-        item  = item_map.get(vid)
+        vid  = doc["videoId"]
+        item = item_map.get(vid)
 
         if not item:
             logger.warning("YouTube から動画情報を取得できませんでした: %s", vid)
@@ -235,7 +240,6 @@ def main() -> None:
 
         live_status, scheduled_jst = get_live_status(item)
 
-        # 配信終了済み（none）→ DB を更新してスキップ
         if live_status == "none":
             collection.update_one(
                 {"videoId": vid},
@@ -249,7 +253,6 @@ def main() -> None:
             logger.info("[スキップ] 配信終了/削除: %s", vid)
             continue
 
-        # scheduledStartJST を最新値で更新
         if scheduled_jst and scheduled_jst != doc.get("scheduledStartJST"):
             collection.update_one(
                 {"videoId": vid},
@@ -257,19 +260,16 @@ def main() -> None:
             )
             doc["scheduledStartJST"] = scheduled_jst
 
-        # リマインドウィンドウ内かチェック
         if not is_within_remind_window(doc.get("scheduledStartJST")):
             logger.info("[スキップ] リマインド時間外: %s (予定: %s)", vid, doc.get("scheduledStartJST"))
             continue
 
-        # 色を決定
         color = DISCORD_COLOR_LIVE if live_status == "live" else DISCORD_COLOR_UPCOMING
 
         try:
-            post_discord(args.webhook, doc, live_status, color, args.role_id if hasattr(args, "role_id") else None)
+            post_discord(webhook, doc, live_status, color, role_id)
             remind_count += 1
 
-            # 通知済みに更新
             collection.update_one(
                 {"videoId": vid},
                 {"$set": {
@@ -282,7 +282,33 @@ def main() -> None:
         except requests.RequestException as e:
             logger.error("Discord 送信失敗 (%s): %s", vid, e)
 
-    logger.info("リマインド完了: %d 件送信", remind_count)
+    return remind_count
+
+
+def main() -> None:
+    args = parse_args()
+
+    missing = [k for k, v in {
+        "api-key":   args.api_key,
+        "mongo-uri": args.mongo_uri,
+    }.items() if not v]
+    if missing:
+        logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
+        sys.exit(1)
+
+    client = get_db(args.mongo_uri)
+    talents = get_talents(client)
+    videos_collection = get_video_collection(client)
+
+    if not talents:
+        logger.info("talents が見つかりません。終了します。")
+        return
+
+    total_count = 0
+    for talent in talents:
+        total_count += process_talent(talent, videos_collection, args.api_key)
+
+    logger.info("リマインド完了: %d 件送信", total_count)
 
 
 if __name__ == "__main__":

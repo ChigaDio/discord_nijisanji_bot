@@ -16,10 +16,10 @@ MongoDB コレクション: youtube_notifications.playlists
 
 環境変数:
     YOUTUBE_API_KEY   : YouTube Data API v3 のキー
-    CHANNEL_ID        : 対象チャンネル ID (UC〇〇 形式)
     MONGODB_URI       : MongoDB 接続文字列
-    DISCORD_WEBHOOK   : Discord Webhook URL
-    ROLE_ID           : Discord ロール ID
+
+データベース:
+    nijisanji.talents に role_id, youtube_channel_id, webhook_playlist_url を保持していること
 """
 
 import os
@@ -130,10 +130,29 @@ def build_playlist_doc(item: dict) -> dict:
 # MongoDB
 # ══════════════════════════════════════════════════════════════
 
+def get_db(uri: str):
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+    return client
+
+
 def get_collection(uri: str):
     """playlists コレクションを返す。"""
     client = MongoClient(uri, serverSelectionTimeoutMS=10000)
     return client["youtube_notifications"]["playlists"]
+
+
+def get_talents(client) -> list[dict]:
+    """nijisanji.talents コレクションから全 talent ドキュメントを取得する。"""
+    db = client["nijisanji"]
+    return list(db["talents"].find({}))
+
+
+def is_valid_talent(talent: dict) -> bool:
+    return bool(
+        talent.get("youtube_channel_id") and
+        talent.get("webhook_playlist_url") and
+        talent.get("role_id")
+    )
 
 
 def is_first_run(collection) -> bool:
@@ -266,51 +285,38 @@ def post_summary(webhook_url: str, total: int, channel_id: str) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="YouTube 再生リスト → MongoDB → Discord 通知")
-    parser.add_argument("--api-key",    default=os.getenv("YOUTUBE_API_KEY"), help="YouTube Data API キー")
-    parser.add_argument("--channel-id", default=os.getenv("CHANNEL_ID"),      help="YouTube チャンネル ID (UC〇〇)")
-    parser.add_argument("--mongo-uri",  default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
-    parser.add_argument("--webhook",    default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
-    parser.add_argument("--role-id",    default=os.getenv("ROLE_ID"),          help="Discord ロール ID")
+    parser.add_argument("--api-key",   default=os.getenv("YOUTUBE_API_KEY"), help="YouTube Data API キー")
+    parser.add_argument("--mongo-uri", default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def process_talent_playlists(talent: dict, api_key: str, collection) -> int:
+    role_id    = talent.get("role_id")
+    webhook    = talent.get("webhook_playlist_url")
+    channel_id = talent.get("youtube_channel_id")
 
-    missing = [k for k, v in {
-        "api-key":    args.api_key,
-        "channel-id": args.channel_id,
-        "mongo-uri":  args.mongo_uri,
-        "webhook":    args.webhook,
-        "role-id":    args.role_id,
-    }.items() if not v]
-    if missing:
-        logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
-        sys.exit(1)
+    if not is_valid_talent(talent):
+        logger.warning(
+            "Talent %s をスキップします。必須フィールド不足: %s",
+                talent.get("name"),
+            {"id": talent.get("_id"), "channel_id": channel_id, "role_id": role_id, "webhook_url": webhook},
+        )
+        return 0
 
-    collection = get_collection(args.mongo_uri)
-    first_run  = is_first_run(collection)
-
-    if first_run:
-        logger.info("=== 初回実行: 全再生リストを取得して保存・通知します ===")
-    else:
-        logger.info("=== 通常実行: 新規再生リストを差分チェックします ===")
-
-    # ── YouTube API から全再生リストを取得 ──
-    try:
-        yt_items = fetch_all_playlists(args.api_key, args.channel_id)
-    except requests.RequestException as e:
-        logger.error("YouTube API エラー: %s", e)
-        sys.exit(1)
-
-    if not yt_items:
-        logger.info("再生リストが見つかりませんでした。終了します。")
-        return
-
-    # ── 既存IDをDBから取得（通常実行時の差分検出用）──
+    first_run = is_first_run(collection)
     existing_ids = set() if first_run else get_existing_playlist_ids(collection)
 
-    # ── 各再生リストを処理 ──
+    logger.info("[%s] %s の再生リストを取得中...", channel_id, talent.get("name", "talent"))
+    try:
+        yt_items = fetch_all_playlists(api_key, channel_id)
+    except requests.RequestException as e:
+        logger.error("[%s] YouTube API エラー: %s", channel_id, e)
+        return 0
+
+    if not yt_items:
+        logger.info("[%s] 再生リストが見つかりませんでした。", channel_id)
+        return 0
+
     new_count = 0
     for item in yt_items:
         doc         = build_playlist_doc(item)
@@ -318,54 +324,56 @@ def main():
 
         upsert_playlist(collection, doc)
 
-        if first_run:
-            # 初回: 全件を青色で通知
-            try:
-                post_discord(
-                    args.webhook, doc,
-                    color=DISCORD_COLOR_INITIAL, label="初回登録",
-                    roleID=args.role_id,
-                )
-                mark_notified(collection, playlist_id)
-                new_count += 1
-            except requests.RequestException as e:
-                logger.error("Discord 通知失敗 (%s): %s", playlist_id, e)
-            finally:
-                # 成功・失敗問わず次の送信まで待機（レート制限対策）
-                time.sleep(DISCORD_SEND_INTERVAL)
+        is_new = first_run or playlist_id not in existing_ids
+        if not is_new:
+            logger.info("[%s] [既存] %s をスキップ", channel_id, playlist_id)
+            continue
 
-        else:
-            # 通常: 新規のみ赤色で通知
-            if playlist_id not in existing_ids:
-                logger.info("[新規再生リスト] %s - %s", playlist_id, doc["title"][:40])
-                try:
-                    post_discord(
-                        args.webhook, doc,
-                        color=DISCORD_COLOR_NEW, label="新規再生リスト",
-                        roleID=args.role_id,
-                    )
-                    mark_notified(collection, playlist_id)
-                    new_count += 1
-                except requests.RequestException as e:
-                    logger.error("Discord 通知失敗 (%s): %s", playlist_id, e)
-                finally:
-                    time.sleep(DISCORD_SEND_INTERVAL)
-            else:
-                logger.info("[既存] %s をスキップ", playlist_id)
+        color = DISCORD_COLOR_INITIAL if first_run else DISCORD_COLOR_NEW
+        label = "初回登録" if first_run else "新規再生リスト"
 
-    # 初回実行時はサマリーも送信
+        try:
+            post_discord(webhook, doc, color=color, label=label, roleID=role_id)
+            mark_notified(collection, playlist_id)
+            new_count += 1
+        except requests.RequestException as e:
+            logger.error("[%s] Discord 通知失敗 (%s): %s", channel_id, playlist_id, e)
+        finally:
+            time.sleep(DISCORD_SEND_INTERVAL)
+
     if first_run:
         try:
-            post_summary(args.webhook, new_count, args.channel_id)
+            post_summary(webhook, new_count, channel_id)
         except requests.RequestException as e:
-            logger.error("サマリー通知失敗: %s", e)
+            logger.error("[%s] サマリー通知失敗: %s", channel_id, e)
 
-    logger.info(
-        "処理完了 (%s): 通知 %d 件 / 合計 %d 件",
-        "初回" if first_run else "通常",
-        new_count,
-        len(yt_items),
-    )
+    return new_count
+
+
+def main():
+    args = parse_args()
+
+    missing = [k for k, v in {
+        "api-key":   args.api_key,
+        "mongo-uri": args.mongo_uri,
+    }.items() if not v]
+    if missing:
+        logger.error("必須パラメータが未設定です: %s", ", ".join(missing))
+        sys.exit(1)
+
+    client     = get_db(args.mongo_uri)
+    talents    = get_talents(client)
+    collection = get_collection(args.mongo_uri)
+
+    if not talents:
+        logger.info("talents が見つかりません。終了します。")
+        return
+
+    total_count = 0
+    for talent in talents:
+        total_count += process_talent_playlists(talent, args.api_key, collection)
+
+    logger.info("全talent処理完了: 通知 %d 件", total_count)
 
 
 if __name__ == "__main__":

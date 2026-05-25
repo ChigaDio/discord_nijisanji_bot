@@ -36,6 +36,4 @@ jobs:
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           MONGODB_URI:     ${{ secrets.MONGODB_URI }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_NOTICE }}
-          ROLE_ID:         ${{ inputs.role_id || secrets.ROLE_ID }}
         run: python scripts/remind_live.py

@@ -42,8 +42,5 @@ jobs:
       - name: "▶️ fetch_playlists.py 実行"
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          CHANNEL_ID:      ${{ inputs.channel_id || secrets.CHANNEL_ID }}
           MONGODB_URI:     ${{ secrets.MONGODB_URI }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_PLAYLIST_NOTICE }}
-          ROLE_ID:         ${{ inputs.role_id || secrets.ROLE_ID }}
         run: python scripts/fetch_playlists.py
