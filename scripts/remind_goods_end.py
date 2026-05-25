@@ -105,7 +105,7 @@ def post_discord(webhook_url: str, doc: dict, label: str, color: int, role_id: s
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="グッズ終了前リマインド通知スクリプト")
     parser.add_argument("--mongo-uri", default=os.getenv("MONGODB_URI"), help="MongoDB 接続文字列")
-    parser.add_argument("--webhook", default=os.getenv("DISCORD_WEBHOOK"), help="Discord Webhook URL")
+    parser.add_argument("--webhook", default=os.getenv("DISCORD_GOODS_WEBHOOK"), help="Discord Webhook URL")
     parser.add_argument("--notify-role-id", default=os.getenv("DISCORD_NIJISANJI_GOODS_NOTIFY_ROLE_ID"), help="通知する Discord ロール ID")
     return parser.parse_args()
 

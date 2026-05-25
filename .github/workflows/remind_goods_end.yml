@@ -27,6 +27,6 @@ jobs:
       - name: "▶️ remind_goods_end.py 実行"
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_GOODS_WEBHOOK: ${{ secrets.DISCORD_GOODS_WEBHOOK }}
           DISCORD_NIJISANJI_GOODS_NOTIFY_ROLE_ID: ${{ secrets.DISCORD_NIJISANJI_GOODS_NOTIFY_ROLE_ID }}
         run: python scripts/remind_goods_end.py

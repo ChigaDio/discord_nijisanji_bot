@@ -48,7 +48,7 @@ def get_collection_goods(uri: str):
 def parse_args():
     parser = argparse.ArgumentParser(description="YouTube → MongoDB → Discord 通知スクリプト")
     parser.add_argument("--mongo-uri",   default=os.getenv("MONGODB_URI"),      help="MongoDB 接続文字列")
-    parser.add_argument("--webhook",     default=os.getenv("DISCORD_WEBHOOK"),  help="Discord Webhook URL")
+    parser.add_argument("--webhook",     default=os.getenv("DISCORD_GOODS_WEBHOOK"),  help="Discord Webhook URL")
     parser.add_argument("--notify_role_id", default=os.getenv("DISCORD_NIJISANJI_GOODS_NOTIFY_ROLE_ID"), help="通知する Discord ロール ID")
     return parser.parse_args()
 
