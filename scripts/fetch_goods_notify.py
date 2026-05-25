@@ -234,7 +234,6 @@ def main():
                     {"name": "説明", "value": description or "なし", "inline": False},
                 ]
                 embed = {
-                    "content": f"<@&{args.notify_role_id}>",
                     "title": goods["name"],
                     "url": goods["url"],
                     "color": 0xFFFFFF,
@@ -243,6 +242,7 @@ def main():
                 }
                 
                 payload = {
+                            "content": f"<@&{args.notify_role_id}>",
                             "username": "Nijisanji Goods Bot",
                             "embeds":   [embed],
                 }
